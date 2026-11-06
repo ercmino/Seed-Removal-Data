@@ -1,0 +1,479 @@
+---
+title: "Seed Predation Analysis (Reference Excluded)"
+author: "Eric Minogue"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+
+required_packages <- c(
+  "readxl", "dplyr", "MASS", "emmeans", "car", "ggplot2",
+  "multcomp", "multcompView", "broom", "knitr"
+)
+
+missing_packages <- required_packages[!vapply(
+  required_packages, requireNamespace, logical(1), quietly = TRUE
+)]
+if (length(missing_packages) > 0) {
+  stop("Install the following packages before knitting: ",
+       paste(missing_packages, collapse = ", "))
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# Sum-to-zero contrasts make Type III tests appropriate for these factorial models.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+theme_set(theme_minimal(base_size = 12))
+
+treatment_labels <- c(
+  "SL" = "Single Litter",
+  "DL" = "Double Litter",
+  "NL" = "No Litter"
+)
+
+# Make compact-letter displays from the same Tukey-adjusted pairwise tests
+# reported in the tables. Groups that share a letter are not significantly different.
+make_tukey_letters <- function(emm_object) {
+  pairwise_results <- as.data.frame(summary(pairs(emm_object, adjust = "tukey")))
+  p_values <- pairwise_results$p.value
+  names(p_values) <- gsub(" / ", "-", pairwise_results$contrast, fixed = TRUE)
+  letter_vector <- multcompView::multcompLetters(p_values, Letters = letters)$Letters
+  tibble::tibble(level = names(letter_vector), letters = unname(letter_vector))
+}
+```
+
+# Overview
+
+This document analyzes seed predation from the **Totals** sheet and invertebrate
+observations from the **Surveys** sheet of `Invertebrate_seed_predation_2025.xlsx`.
+The workflow uses negative-binomial generalized linear models because the response
+variables are counts. Reference plots are excluded from every analysis.
+Single Litter is the control treatment.
+
+```{r import-and-clean}
+excel_file <- "Invertebrate_seed_predation_2025.xlsx"
+if (!file.exists(excel_file)) {
+  stop("Could not find ", excel_file,
+       ". Open this Rmd from the folder that contains the workbook.")
+}
+
+# The first seven columns of the Totals sheet are the raw seed-predation data;
+# later columns contain spreadsheet summaries and are intentionally excluded.
+predation_data <- read_excel(excel_file, sheet = "Totals ", .name_repair = "minimal")
+predation_data <- predation_data[, 1:7]
+names(predation_data) <- c(
+    "plot", "treatment", "time", "date", "number_seeds_predated",
+    "rain_in", "wet"
+  )
+predation_data <- predation_data |>
+  dplyr::mutate(
+    plot = factor(plot),
+    treatment = factor(treatment, levels = c("SL", "DL", "NL")),
+    time = factor(time, levels = c("Day", "Night")),
+    date = as.Date(date),
+    number_seeds_predated = as.numeric(number_seeds_predated),
+    rain_in = as.numeric(rain_in),
+    wet = factor(wet)
+  ) |>
+  dplyr::filter(
+    !is.na(number_seeds_predated), !is.na(treatment), !is.na(time)
+  )
+
+# Retain the first 13 columns of Surveys; later columns are spreadsheet summaries.
+survey_data <- read_excel(excel_file, sheet = "Surveys", .name_repair = "minimal")
+survey_data <- survey_data[, 1:13]
+names(survey_data) <- c(
+    "plot", "treatment", "round", "date", "hour", "time",
+    "number_predated", "slugs_present", "ants_present", "ua_present",
+    "temperature_f", "humidity_pct", "wet"
+  )
+survey_data <- survey_data |>
+  dplyr::mutate(
+    plot = factor(plot),
+    treatment = factor(treatment, levels = c("SL", "DL", "NL")),
+    round = factor(round),
+    date = as.Date(date),
+    time = factor(time, levels = c("E", "M", "N")),
+    number_predated = as.numeric(number_predated),
+    slugs_present = as.numeric(slugs_present),
+    ants_present = as.numeric(ants_present),
+    ua_present = as.numeric(ua_present),
+    temperature_f = as.numeric(temperature_f),
+    humidity_pct = as.numeric(humidity_pct),
+    wet = factor(wet)
+  ) |>
+  dplyr::filter(!is.na(treatment), !is.na(time))
+
+data_summary <- dplyr::bind_rows(
+  predation_data |>
+    dplyr::summarise(data_set = "Seed predation (Totals)", n = dplyr::n()),
+  survey_data |>
+    dplyr::summarise(data_set = "Invertebrate surveys", n = dplyr::n())
+)
+knitr::kable(data_summary, caption = "Rows retained for analysis")
+```
+
+# Seed predation
+
+## Model and omnibus tests
+
+```{r seed-predation-model}
+seed_model <- MASS::glm.nb(
+  number_seeds_predated ~ treatment * time,
+  data = predation_data
+)
+
+seed_dispersion <- sum(residuals(seed_model, type = "pearson")^2) /
+  df.residual(seed_model)
+
+knitr::kable(
+  broom::tidy(seed_model), digits = 3,
+  caption = "Negative-binomial model coefficients for seed predation"
+)
+
+seed_anova <- car::Anova(seed_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+knitr::kable(seed_anova, digits = 3,
+             caption = "Type III tests for seed predation")
+
+cat("Pearson dispersion ratio:", round(seed_dispersion, 2), "\n")
+```
+
+## Treatment differences within time of day
+
+```{r seed-predation-emmeans}
+seed_emm <- emmeans::emmeans(seed_model, ~ treatment | time, type = "response")
+seed_pairwise <- pairs(seed_emm, adjust = "tukey")
+seed_letters <- dplyr::bind_rows(lapply(levels(predation_data$time), function(time_level) {
+  time_emm <- emmeans::emmeans(
+    seed_model, ~ treatment, at = list(time = time_level), type = "response"
+  )
+  make_tukey_letters(time_emm) |>
+    dplyr::transmute(
+      treatment = factor(level, levels = levels(predation_data$treatment)),
+      time = time_level,
+      letters
+    )
+})) |>
+  dplyr::mutate(time = factor(time, levels = levels(predation_data$time)))
+
+knitr::kable(
+  as.data.frame(summary(seed_emm)), digits = 3,
+  caption = "Estimated mean seed predation by treatment and time"
+)
+knitr::kable(
+  broom::tidy(seed_pairwise), digits = 3,
+  caption = "Tukey-adjusted treatment comparisons within time of day"
+)
+```
+
+```{r seed-predation-figure}
+# One letter family compares all treatment × time combinations in this figure.
+seed_all_emm <- emmeans::emmeans(seed_model, ~ treatment * time, type = "response")
+seed_all_letters <- make_tukey_letters(seed_all_emm) |>
+  dplyr::transmute(
+    treatment = factor(sub(" .*", "", level), levels = levels(predation_data$treatment)),
+    time = sub("^.* ", "", level),
+    letters
+  )
+
+seed_plot_data <- as.data.frame(summary(seed_all_emm)) |>
+  dplyr::left_join(seed_all_letters, by = c("treatment", "time")) |>
+  dplyr::mutate(
+    se_lower = pmax(0, response - SE),
+    se_upper = response + SE,
+    label_y = se_upper + 0.04 * max(response)
+  )
+
+ggplot(seed_plot_data, aes(x = treatment, y = response, fill = time)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(
+    aes(ymin = se_lower, ymax = se_upper),
+    position = position_dodge(width = 0.8), width = 0.2
+  ) +
+  geom_text(
+    aes(y = label_y, label = letters, group = time),
+    position = position_dodge(width = 0.8), vjust = 0, size = 5
+  ) +
+  scale_x_discrete(labels = treatment_labels) +
+  scale_fill_manual(values = c("Day" = "#FFD84D", "Night" = "#001F3F")) +
+  labs(
+    x = "Treatment", y = "Estimated mean seeds removed",
+    fill = "Time of day",
+    #title = "Seed predation by treatment and time of day",
+    #subtitle = "Error bars show ±1 standard error; letters compare all treatment × time groups"
+  )
+```
+
+## Planned comparisons with the Single Litter control
+
+```{r seed-predation-control-comparisons}
+seed_treatment_emm <- emmeans::emmeans(seed_model, ~ treatment, type = "response")
+seed_vs_single_litter <- contrast(
+  seed_treatment_emm, method = "trt.vs.ctrl", ref = "SL", adjust = "dunnett"
+)
+knitr::kable(
+  broom::tidy(seed_vs_single_litter), digits = 3,
+  caption = "Dunnett-adjusted comparisons with the Single Litter control, averaged across time"
+)
+```
+
+## Mean seed predation by treatment
+
+```{r seed-treatment-figure}
+seed_treatment_letters <- make_tukey_letters(seed_treatment_emm) |>
+  dplyr::transmute(
+    treatment = factor(level, levels = levels(predation_data$treatment)), letters
+  )
+
+seed_treatment_plot <- as.data.frame(summary(seed_treatment_emm)) |>
+  dplyr::left_join(seed_treatment_letters, by = "treatment") |>
+  dplyr::mutate(
+    se_lower = pmax(0, response - SE),
+    se_upper = response + SE,
+    label_y = se_upper + 0.04 * max(response)
+  )
+
+ggplot(seed_treatment_plot, aes(x = treatment, y = response)) +
+  geom_col(fill = "#8A5406", width = 0.7, color = "black") +
+  geom_errorbar(aes(ymin = se_lower, ymax = se_upper), width = 0.2) +
+  geom_text(aes(y = label_y, label = letters), vjust = 0, size = 5) +
+  scale_x_discrete(labels = treatment_labels) +
+  labs(
+    x = "Treatment", y = "Estimated mean number of seeds removed",
+    #title = "Mean seed predation by treatment",
+    #subtitle = "Means are averaged across day and night; error bars show ±1 standard error"
+  )
+```
+
+# Invertebrate observations
+
+The survey models use the recorded counts of slugs and ants. They are analyzed
+separately because these organisms have different activity patterns.
+
+## Treatment effects
+
+```{r invertebrate-treatment-models}
+slug_treatment_model <- MASS::glm.nb(slugs_present ~ treatment, data = survey_data)
+ant_treatment_model <- MASS::glm.nb(ants_present ~ treatment, data = survey_data)
+
+slug_treatment_anova <- car::Anova(slug_treatment_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+ant_treatment_anova <- car::Anova(ant_treatment_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+
+knitr::kable(slug_treatment_anova, digits = 3,
+             caption = "Type III test: slug counts by treatment")
+knitr::kable(ant_treatment_anova, digits = 3,
+             caption = "Type III test: ant counts by treatment")
+```
+
+```{r invertebrate-treatment-figure}
+slug_treatment_emm <- emmeans::emmeans(
+  slug_treatment_model, ~ treatment, type = "response"
+)
+ant_treatment_emm <- emmeans::emmeans(
+  ant_treatment_model, ~ treatment, type = "response"
+)
+slug_treatment_letters <- make_tukey_letters(slug_treatment_emm) |>
+  dplyr::transmute(
+    treatment = factor(level, levels = levels(survey_data$treatment)), letters
+  )
+ant_treatment_letters <- make_tukey_letters(ant_treatment_emm) |>
+  dplyr::transmute(
+    treatment = factor(level, levels = levels(survey_data$treatment)), letters
+  )
+
+invertebrate_treatment_plot <- dplyr::bind_rows(
+  as.data.frame(summary(slug_treatment_emm)) |>
+    dplyr::left_join(slug_treatment_letters, by = "treatment") |>
+    dplyr::mutate(species = "Slug"),
+  as.data.frame(summary(ant_treatment_emm)) |>
+    dplyr::left_join(ant_treatment_letters, by = "treatment") |>
+    dplyr::mutate(species = "Ant")
+) |>
+  dplyr::mutate(
+    se_lower = pmax(0, response - SE),
+    se_upper = response + SE,
+    label_y = se_upper + 0.04 * max(response)
+  )
+
+ggplot(invertebrate_treatment_plot,
+       aes(x = treatment, y = response, fill = species)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(
+    aes(ymin = se_lower, ymax = se_upper),
+    position = position_dodge(width = 0.8), width = 0.2
+  ) +
+  geom_text(
+    aes(y = label_y, label = letters, group = species),
+    position = position_dodge(width = 0.8), vjust = 0, size = 5
+  ) +
+  scale_x_discrete(labels = treatment_labels) +
+  scale_fill_manual(values = c("Slug" = "sienna3", "Ant" = "slateblue4")) +
+  labs(
+    x = "Treatment", y = "Estimated mean count", fill = "Organism",
+    #title = "Slug and ant observations by treatment",
+    #subtitle = "Error bars show ±1 standard error; letters compare treatments within each organism"
+  )
+```
+
+## Treatment-by-time models
+
+```{r invertebrate-time-models}
+# The final figure compares the early (E) and late (N) surveys only.
+survey_data_en <- survey_data |>
+  dplyr::filter(time %in% c("E", "N")) |>
+  dplyr::mutate(time = factor(time, levels = c("E", "N")))
+
+slug_time_model <- MASS::glm.nb(slugs_present ~ treatment * time, data = survey_data_en)
+ant_time_model <- MASS::glm.nb(ants_present ~ treatment * time, data = survey_data_en)
+
+slug_time_anova <- car::Anova(slug_time_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+ant_time_anova <- car::Anova(ant_time_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+
+knitr::kable(slug_time_anova, digits = 3,
+             caption = "Type III tests: slug counts by treatment and time")
+knitr::kable(ant_time_anova, digits = 3,
+             caption = "Type III tests: ant counts by treatment and time")
+```
+
+## Seed predation between morning and evening surveys
+
+```{r survey-seed-predation-figure}
+survey_predation_data <- survey_data_en |>
+  dplyr::filter(!is.na(number_predated))
+
+survey_predation_model <- MASS::glm.nb(
+  number_predated ~ treatment * time,
+  data = survey_predation_data
+)
+survey_predation_anova <- car::Anova(survey_predation_model, type = 3) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("term")
+knitr::kable(
+  survey_predation_anova, digits = 3,
+  caption = "Type III tests: seed predation between surveys"
+)
+
+survey_predation_emm <- emmeans::emmeans(
+  survey_predation_model, ~ treatment * time, type = "response"
+)
+survey_predation_letters <- make_tukey_letters(survey_predation_emm) |>
+  dplyr::transmute(
+    treatment = factor(sub(" .*", "", level), levels = levels(survey_data$treatment)),
+    time = sub("^.* ", "", level),
+    letters
+  )
+
+survey_predation_plot <- as.data.frame(summary(survey_predation_emm)) |>
+  dplyr::left_join(survey_predation_letters, by = c("treatment", "time")) |>
+  dplyr::mutate(
+    treatment_time = factor(
+      paste(treatment, time, sep = "_"),
+      levels = c("SL_E", "SL_N", "DL_E", "DL_N", "NL_E", "NL_N")
+    ),
+    se_lower = pmax(0, response - SE),
+    se_upper = response + SE,
+    label_y = se_upper + 0.04 * max(response)
+  )
+
+# Grouped treatment figure: morning and evening bars are shown together by treatment.
+ggplot(survey_predation_plot, aes(x = treatment, y = response, fill = time)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(
+    aes(ymin = se_lower, ymax = se_upper),
+    position = position_dodge(width = 0.8), width = 0.2
+  ) +
+  geom_text(
+    aes(y = label_y, label = letters, group = time),
+    position = position_dodge(width = 0.8), vjust = 0, size = 5
+  ) +
+  scale_x_discrete(labels = treatment_labels) +
+  scale_fill_manual(
+    values = c("E" = "#FFD84D", "N" = "#001F3F"),
+    labels = c("E" = "Morning", "N" = "Evening")
+  ) +
+  labs(
+    x = "Treatment", y = "Estimated mean seeds removed",
+    fill = "Survey time",
+   # title = "Seed predation by treatment between morning and evening surveys",
+   #subtitle = "Error bars show ±1 standard error; letters compare all treatment × time groups"
+  )
+ 
+)
+
+```
+
+```{r invertebrate-time-figure}
+# Each set of letters compares all six treatment × time groups within one organism.
+slug_time_emm <- emmeans::emmeans(slug_time_model, ~ treatment * time, type = "response")
+ant_time_emm <- emmeans::emmeans(ant_time_model, ~ treatment * time, type = "response")
+slug_time_letters <- make_tukey_letters(slug_time_emm) |>
+  dplyr::transmute(
+    treatment = factor(sub(" .*", "", level), levels = levels(survey_data$treatment)),
+    time = sub("^.* ", "", level),
+    letters
+  )
+ant_time_letters <- make_tukey_letters(ant_time_emm) |>
+  dplyr::transmute(
+    treatment = factor(sub(" .*", "", level), levels = levels(survey_data$treatment)),
+    time = sub("^.* ", "", level),
+    letters
+  )
+
+invertebrate_time_plot <- dplyr::bind_rows(
+  as.data.frame(summary(slug_time_emm)) |>
+    dplyr::left_join(slug_time_letters, by = c("treatment", "time")) |>
+    dplyr::mutate(species = "Slug"),
+  as.data.frame(summary(ant_time_emm)) |>
+    dplyr::left_join(ant_time_letters, by = c("treatment", "time")) |>
+    dplyr::mutate(species = "Ant")
+) |>
+  dplyr::group_by(treatment, species) |>
+  dplyr::mutate(
+    se_lower = pmax(0, response - SE),
+    se_upper = response + SE,
+    label_y = se_upper + 0.04 * max(response)
+  ) |>
+  dplyr::ungroup()
+
+ggplot(invertebrate_time_plot, aes(x = time, y = response, fill = species)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_errorbar(
+    aes(ymin = se_lower, ymax = se_upper),
+    position = position_dodge(width = 0.8), width = 0.2
+  ) +
+  geom_text(
+    aes(y = label_y, label = letters, group = species),
+    position = position_dodge(width = 0.8), vjust = 0, size = 4
+  ) +
+  facet_wrap(~ treatment, labeller = labeller(treatment = treatment_labels)) +
+  scale_fill_manual(values = c("Slug" = "sienna3", "Ant" = "slateblue4")) +
+  labs(
+    x = "Survey time", y = "Estimated mean count", fill = "Organism",
+    #title = "Slug and ant observations during early and late surveys",
+    #subtitle = "Error bars show ±1 standard error; letters compare all treatment × time groups within each organism"
+  )
+```
+
+# Reproducibility
+
+```{r session-info}
+sessionInfo()
+```
